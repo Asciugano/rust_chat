@@ -1,5 +1,7 @@
+use getrandom;
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Write as FmtWrite;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::result;
@@ -190,7 +192,13 @@ fn server(messages: Receiver<Message>) -> Result<()> {
     }
 }
 
-fn client(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
+fn authorized(stream: Arc<TcpStream>, token: &String) -> Result<()> {
+    todo!();
+}
+
+fn client(stream: Arc<TcpStream>, messages: Sender<Message>, token: String) -> Result<()> {
+    authorized(stream, &token)?;
+
     let author_addr = stream.peer_addr().map_err(|err| {
         eprint!("[ERROR]: Could not get peer_addr: {}", Sensitive(err));
     })?;
@@ -222,7 +230,12 @@ fn client(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
                 });
         })?;
         if n > 0 {
-            let bytes = buffer[0..n].to_vec();
+            let mut bytes = Vec::new();
+            for x in &buffer[0..n] {
+                if *x >= 32 {
+                    bytes.push(*x);
+                }
+            }
             let _ = messages
                 .send(Message::NewMessage { bytes, author_addr })
                 .map_err(|err| {
@@ -247,6 +260,21 @@ fn client(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let mut buffer = [0; 16];
+    let _ = getrandom::fill(&mut buffer).map_err(|err| {
+        eprint!(
+            "[ERROR]: Could not generate random random access buffer: {}",
+            Sensitive(err)
+        );
+    });
+
+    let mut token = String::new();
+    for x in buffer {
+        let _ = write!(&mut token, "{x:02X}");
+    }
+
+    println!("[TOKEN]: {token}");
+
     let address = "0.0.0.0:4444";
     let listener = TcpListener::bind(address).map_err(|err| {
         eprintln!(
@@ -265,7 +293,8 @@ fn main() -> Result<()> {
             Ok(stream) => {
                 let stream = Arc::new(stream);
                 let message_sender = message_sender.clone();
-                thread::spawn(|| client(stream, message_sender));
+                let token = token.clone();
+                thread::spawn(|| client(stream, message_sender, token));
             }
             Err(err) => {
                 eprintln!("[ERROR]: Could not accept connection: {}", Sensitive(err));
