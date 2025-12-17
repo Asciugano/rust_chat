@@ -47,6 +47,7 @@ struct Client {
     conn: Arc<TcpStream>,
     last_message: SystemTime,
     strike_count: u16,
+    authed: bool,
 }
 
 fn server(messages: Receiver<Message>) -> Result<()> {
@@ -99,8 +100,17 @@ fn server(messages: Receiver<Message>) -> Result<()> {
                             conn: author.clone(),
                             last_message: now,
                             strike_count: 0,
+                            authed: false,
                         },
                     );
+
+                    let _ = writeln!(author.as_ref(), "Token: ").map_err(|err| {
+                        eprintln!(
+                            "[ERROR]: Could not send Token prompt to {}: {}",
+                            Sensitive(author_addr),
+                            Sensitive(err)
+                        );
+                    });
                 }
             }
             Message::ClientDisconected { author_addr } => {
@@ -124,16 +134,19 @@ fn server(messages: Receiver<Message>) -> Result<()> {
                                 "[INFO]: Client {addr} sent message: {bytes:?}",
                                 addr = Sensitive(author_addr),
                             );
-                            for (addr, client) in clients.iter() {
-                                if *addr != author_addr {
-                                    let _ = client.conn.as_ref().write(&bytes).map_err(|err| {
-                                    eprintln!(
-                                        "[ERROR]: Could not broadcast message to all the clients from {addr}: {err}",
-                                        addr = Sensitive(author_addr),
-                                        err = Sensitive(err)
-                                    )
-                                    });
+                            if author.authed {
+                                for (addr, client) in clients.iter() {
+                                    if *addr != author_addr && client.authed {
+                                        let _ = client.conn.as_ref().write(&bytes).map_err(|err| {
+                                            eprintln!(
+                                                "[ERROR]: Could not broadcast message to all the clients from {addr}: {err}",
+                                                addr = Sensitive(author_addr),
+                                                err = Sensitive(err)
+                                            )
+                                        });
+                                    }
                                 }
+                            } else {
                             }
                         } else {
                             author.strike_count += 1;
@@ -225,39 +238,39 @@ fn client(stream: Arc<TcpStream>, messages: Sender<Message>, token: String) -> R
         eprintln!("[ERROR]: Could not get peer_addr: {}", Sensitive(err));
     })?;
 
-    let _ = writeln!(stream.as_ref(), "Token: ").map_err(|err| {
-        eprintln!(
-            "[ERROR]: Could not send Token prompt to {}: {}",
-            Sensitive(author_addr),
-            Sensitive(err)
-        );
-    });
-
-    authorize(&stream, &author_addr, &token).map_err(|()| {
-        let _ = writeln!(stream.as_ref(), "Invalid Token").map_err(|err| {
-            eprintln!(
-                "[ERROR]: Could not notify the client {} about invalid token: {}",
-                Sensitive(author_addr),
-                Sensitive(err)
-            );
-        });
-        eprintln!("[ERROR]: failed to authorized");
-        let _ = stream.shutdown(Shutdown::Both).map_err(|err| {
-            eprintln!(
-                "[ERROR]: Could not shutdown {}: {}",
-                Sensitive(author_addr),
-                Sensitive(err)
-            );
-        });
-    })?;
-    println!("[INFO]: {} authorized", Sensitive(author_addr));
-    let _ = writeln!(stream.as_ref(), "Welcome to the club").map_err(|err| {
-        eprintln!(
-            "[ERROR]: Could not send the welcome message to {}: {}",
-            Sensitive(author_addr),
-            Sensitive(err)
-        );
-    })?;
+    // let _ = writeln!(stream.as_ref(), "Token: ").map_err(|err| {
+    //     eprintln!(
+    //         "[ERROR]: Could not send Token prompt to {}: {}",
+    //         Sensitive(author_addr),
+    //         Sensitive(err)
+    //     );
+    // });
+    //
+    // authorize(&stream, &author_addr, &token).map_err(|()| {
+    //     let _ = writeln!(stream.as_ref(), "Invalid Token").map_err(|err| {
+    //         eprintln!(
+    //             "[ERROR]: Could not notify the client {} about invalid token: {}",
+    //             Sensitive(author_addr),
+    //             Sensitive(err)
+    //         );
+    //     });
+    //     eprintln!("[ERROR]: failed to authorized");
+    //     let _ = stream.shutdown(Shutdown::Both).map_err(|err| {
+    //         eprintln!(
+    //             "[ERROR]: Could not shutdown {}: {}",
+    //             Sensitive(author_addr),
+    //             Sensitive(err)
+    //         );
+    //     });
+    // })?;
+    // println!("[INFO]: {} authorized", Sensitive(author_addr));
+    // let _ = writeln!(stream.as_ref(), "Welcome to the club").map_err(|err| {
+    //     eprintln!(
+    //         "[ERROR]: Could not send the welcome message to {}: {}",
+    //         Sensitive(author_addr),
+    //         Sensitive(err)
+    //     );
+    // })?;
 
     messages
         .send(Message::ClientConnected {
