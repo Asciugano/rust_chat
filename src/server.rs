@@ -225,7 +225,22 @@ fn client(stream: Arc<TcpStream>, messages: Sender<Message>, token: String) -> R
         eprintln!("[ERROR]: Could not get peer_addr: {}", Sensitive(err));
     })?;
 
+    let _ = writeln!(stream.as_ref(), "Token: ").map_err(|err| {
+        eprintln!(
+            "[ERROR]: Could not send Token prompt to {}: {}",
+            Sensitive(author_addr),
+            Sensitive(err)
+        );
+    });
+
     authorize(&stream, &author_addr, &token).map_err(|()| {
+        let _ = writeln!(stream.as_ref(), "Invalid Token").map_err(|err| {
+            eprintln!(
+                "[ERROR]: Could not notify the client {} about invalid token: {}",
+                Sensitive(author_addr),
+                Sensitive(err)
+            );
+        });
         eprintln!("[ERROR]: failed to authorized");
         let _ = stream.shutdown(Shutdown::Both).map_err(|err| {
             eprintln!(
@@ -234,6 +249,14 @@ fn client(stream: Arc<TcpStream>, messages: Sender<Message>, token: String) -> R
                 Sensitive(err)
             );
         });
+    })?;
+    println!("[INFO]: {} authorized", Sensitive(author_addr));
+    let _ = writeln!(stream.as_ref(), "Welcome to the club").map_err(|err| {
+        eprintln!(
+            "[ERROR]: Could not send the welcome message to {}: {}",
+            Sensitive(author_addr),
+            Sensitive(err)
+        );
     })?;
 
     messages
