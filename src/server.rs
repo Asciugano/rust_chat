@@ -127,7 +127,7 @@ fn server(messages: Receiver<Message>) -> Result<()> {
                             for (addr, client) in clients.iter() {
                                 if *addr != author_addr {
                                     let _ = client.conn.as_ref().write(&bytes).map_err(|err| {
-                                    eprint!(
+                                    eprintln!(
                                         "[ERROR]: Could not broadcast message to all the clients from {addr}: {err}",
                                         addr = Sensitive(author_addr),
                                         err = Sensitive(err)
@@ -145,14 +145,14 @@ fn server(messages: Receiver<Message>) -> Result<()> {
                                 );
                                 banned_mfs.insert(author_addr.ip().clone(), now);
                                 let _ = writeln!(author.conn.as_ref(), "You are banned").map_err(|err| {
-                                    eprint!(
+                                    eprintln!(
                                         "[ERROR]: Could not send banned message to {addr}: {err}",
                                         addr = Sensitive(author_addr),
                                         err = Sensitive(err)
                                     )
                                 });
                                 let _ = author.conn.shutdown(Shutdown::Both).map_err(|err| {
-                                    eprint!(
+                                    eprintln!(
                                         "[ERROR]: Could not shutdown socket for {addr}: {err}",
                                         addr = Sensitive(author_addr),
                                         err = Sensitive(err)
@@ -171,14 +171,14 @@ fn server(messages: Receiver<Message>) -> Result<()> {
                             );
                             let _ =
                                 writeln!(author.conn.as_ref(), "You are banned").map_err(|err| {
-                                    eprint!(
+                                    eprintln!(
                                         "[ERROR]: Could not send banned message to {addr}: {err}",
                                         addr = Sensitive(author_addr),
                                         err = Sensitive(err)
                                     )
                                 });
                             let _ = author.conn.shutdown(Shutdown::Both).map_err(|err| {
-                                eprint!(
+                                eprintln!(
                                     "[ERROR]: Could not shutdown socket for {addr}: {err}",
                                     addr = Sensitive(author_addr),
                                     err = Sensitive(err)
@@ -192,16 +192,50 @@ fn server(messages: Receiver<Message>) -> Result<()> {
     }
 }
 
-fn authorized(stream: Arc<TcpStream>, token: &String) -> Result<()> {
-    todo!();
+fn authorize(stream: &Arc<TcpStream>, addr: &SocketAddr, token: &str) -> Result<()> {
+    let mut buf: [u8; 32] = [0; 32];
+    let n = stream.as_ref().read(&mut buf).map_err(|err| {
+        eprintln!(
+            "[ERROR]: Clould not read authorization token from {}: {}",
+            Sensitive(addr),
+            Sensitive(err)
+        );
+    })?;
+
+    if n < buf.len() {
+        eprintln!("[ERROR: Didn't fully read the auth token: only {n} bytes");
+
+        return Err(());
+    }
+
+    let user_token = str::from_utf8(&buf[0..n]).map_err(|err| {
+        eprintln!("[ERROR]: token is not a valid UTF8: {err}");
+    })?;
+
+    if user_token != token {
+        eprintln!("[ERROR]: user provide invalid token");
+        return Err(());
+    }
+
+    Ok(())
 }
 
 fn client(stream: Arc<TcpStream>, messages: Sender<Message>, token: String) -> Result<()> {
-    authorized(stream, &token)?;
-
     let author_addr = stream.peer_addr().map_err(|err| {
-        eprint!("[ERROR]: Could not get peer_addr: {}", Sensitive(err));
+        eprintln!("[ERROR]: Could not get peer_addr: {}", Sensitive(err));
     })?;
+
+    authorize(&stream, &author_addr, &token).map_err(|()| {
+        eprintln!("[ERROR]: failed to authorized");
+        let _ = stream.shutdown(Shutdown::Both).map_err(|err| {
+            eprintln!(
+                "[ERROR]: Could not shutdown {}: {}",
+                Sensitive(author_addr),
+                Sensitive(err)
+            );
+        });
+    })?;
+
     messages
         .send(Message::ClientConnected {
             author: stream.clone(),
@@ -262,7 +296,7 @@ fn client(stream: Arc<TcpStream>, messages: Sender<Message>, token: String) -> R
 fn main() -> Result<()> {
     let mut buffer = [0; 16];
     let _ = getrandom::fill(&mut buffer).map_err(|err| {
-        eprint!(
+        eprintln!(
             "[ERROR]: Could not generate random random access buffer: {}",
             Sensitive(err)
         );
