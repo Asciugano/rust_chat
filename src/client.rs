@@ -4,10 +4,13 @@ use crossterm::{
     event::{Event, KeyCode, KeyModifiers, poll, read},
     terminal::{self, Clear, ClearType},
 };
-use std::io::{ErrorKind, Read, Write, stdout};
 use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
+use std::{
+    env,
+    io::{ErrorKind, Read, Write, stdout},
+};
 
 struct Rect {
     x: usize,
@@ -33,7 +36,12 @@ fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) {
 }
 
 fn main() {
-    let mut stream = TcpStream::connect("localhost:4444").unwrap();
+    let mut args = env::args();
+    let _ = args.next().expect("program name");
+
+    let ip = args.next().expect("provide an Ip");
+
+    let mut stream = TcpStream::connect(&format!("{ip}:4444")).unwrap();
     stream.set_nonblocking(true).unwrap();
 
     let mut stdout = stdout();
@@ -74,6 +82,7 @@ fn main() {
                     KeyCode::Backspace => {
                         prompt.pop();
                     }
+                    KeyCode::Esc => prompt.clear(),
                     _ => {}
                 },
                 Event::Paste(data) => {
