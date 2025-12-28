@@ -4,33 +4,38 @@ use crossterm::{
     event::{Event, KeyCode, KeyModifiers, poll, read},
     terminal::{self, Clear, ClearType},
 };
+use std::io::{ErrorKind, Read, Write, stdout};
+use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
-use std::{
-    io::{Write, stdout},
-    ops::Sub,
-};
 
 struct Rect {
-    x: u16,
-    y: u16,
-    w: u16,
-    h: u16,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
 }
 
-fn chatWindow(stdout: &mut impl QueueableCommand, boundary: Rect, chat: &[String]) {
+fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) {
     let n = chat.len();
-    let m = n.sub(boundary.h).unwrap_or(0);
+    let m = n.checked_sub(boundary.h).unwrap_or(0);
 
-    for (dy, line) in chat.iter().drop(m).enumerate() {
+    for (dy, line) in chat.iter().skip(m).enumerate() {
         stdout
-            .queue(MoveTo(boundary.x, boundary.y + dy as u16))
+            .queue(MoveTo(boundary.x as u16, (boundary.y + dy) as u16))
             .unwrap();
-        stdout.write(line.as_bytes()).unwrap();
+
+        let bytes = line.as_bytes();
+        stdout
+            .write(bytes.get(0..boundary.w).unwrap_or(bytes))
+            .unwrap();
     }
 }
 
 fn main() {
+    let mut stream = TcpStream::connect("localhost:4444").unwrap();
+    stream.set_nonblocking(true).unwrap();
+
     let mut stdout = stdout();
     terminal::enable_raw_mode().unwrap();
     let (mut width, mut height) = terminal::size().unwrap();
@@ -41,6 +46,8 @@ fn main() {
     let mut chat = Vec::<String>::new();
 
     let mut quit = false;
+
+    let mut buf = [0; 64];
 
     while !quit {
         while poll(Duration::ZERO).unwrap() {
@@ -58,7 +65,10 @@ fn main() {
                         prompt.push(x)
                     }
                     KeyCode::Enter => {
-                        chat.push(prompt.clone());
+                        stream.write(prompt.as_bytes()).unwrap();
+                        if prompt.len() > 0 {
+                            chat.push(prompt.clone());
+                        }
                         prompt.clear();
                     }
                     KeyCode::Backspace => {
@@ -66,18 +76,52 @@ fn main() {
                     }
                     _ => {}
                 },
+                Event::Paste(data) => {
+                    prompt.push_str(&data);
+                }
                 _ => {}
             }
         }
 
+        match stream.read(&mut buf) {
+            Ok(n) => {
+                if n > 0 {
+                    chat.push(str::from_utf8(&buf[0..n]).unwrap().to_string())
+                } else {
+                    quit = true;
+                }
+            }
+            Err(err) => {
+                if err.kind() != ErrorKind::WouldBlock {
+                    panic!("{err}");
+                }
+            }
+        }
+
         stdout.queue(Clear(ClearType::All)).unwrap();
+
+        chat_window(
+            &mut stdout,
+            chat.as_mut_slice(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: width as usize,
+                h: (height - 2) as usize,
+            },
+        );
 
         // drawing the bar
         stdout.queue(MoveTo(0, height - 2)).unwrap();
         stdout.write(bar.as_bytes()).unwrap();
 
         stdout.queue(MoveTo(0, height - 1)).unwrap();
-        stdout.write(prompt.as_bytes()).unwrap();
+        {
+            let bytes = prompt.as_bytes();
+            stdout
+                .write(bytes.get(0..width as usize).unwrap_or(bytes))
+                .unwrap();
+        }
 
         stdout.flush().unwrap();
         thread::sleep(Duration::from_millis(33));
