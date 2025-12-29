@@ -11,6 +11,10 @@ path = "./src/server.rs"
 name = "client"
 path = "./src/client.rs"
 
+[[bin]]
+name = "pandora"
+path = "./src/pandora.rs"
+
 [dependencies]
 crossterm = "0.29.0"
 getrandom = "0.3.4"

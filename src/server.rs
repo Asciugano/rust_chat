@@ -12,10 +12,12 @@ use std::time::{Duration, SystemTime};
 
 type Result<T> = result::Result<T, ()>;
 
+const PORT: u16 = 4444;
 const SAFE_MODE: bool = true;
 const BAN_LIMIT: Duration = Duration::from_secs(10 * 60);
 const MESSAGE_RATE: Duration = Duration::from_secs(1);
-const STRIKE_LIMIT: u16 = 10;
+const SLOWORIS_LIMIT: Duration = Duration::from_millis(200);
+const STRIKE_LIMIT: usize = 10;
 
 struct Sensitive<T>(T);
 
@@ -43,11 +45,60 @@ enum Message {
     },
 }
 
+enum Sinner {
+    Striked(usize),
+    Banned(SystemTime),
+}
+
+impl Sinner {
+    fn new() -> Self {
+        Self::Striked(0)
+    }
+
+    fn forgive(&mut self) {
+        *self = Self::Striked(0)
+    }
+
+    fn strike(&mut self) -> bool {
+        match self {
+            Self::Striked(x) => {
+                if *x >= STRIKE_LIMIT {
+                    *self = Self::Banned(SystemTime::now());
+                    true
+                } else {
+                    *x += 1;
+                    false
+                }
+            }
+            Self::Banned(_) => true,
+        }
+    }
+}
+
+struct Server {
+    clients: HashMap<Token, Client>,
+    sinners: HashMap<IpAddr, Sinner>,
+    token: String,
+}
+
+impl Server {
+    fn from_token(token: String) -> Self {
+        Self {
+            clients: HashMap::new(),
+            sinners: HashMap::new(),
+            token,
+        }
+    }
+
+    fn client_connected(&mut self, mut author: TcpStream, author_addr: SocketAddr, token: Token) {}
+}
+
 struct Client {
-    conn: Arc<TcpStream>,
+    conn: TcpStream,
     last_message: SystemTime,
-    strike_count: u16,
+    connected_at: SystemTime,
     authed: bool,
+    addr: SocketAddr,
 }
 
 fn server(messages: Receiver<Message>, token: String) -> Result<()> {
