@@ -418,7 +418,9 @@ fn help_command(client: &mut Client, argument: &str) {
             ..
         }) = find_command(name)
         {
-            chat_info!(client.chat, "Unknown command `:{name}`");
+            chat_info!(client.chat, "{signature} - {description}");
+        } else {
+            chat_error!(client.chat, "Unknown command `:{name}`");
         }
     }
 }
@@ -531,6 +533,63 @@ fn main() -> io::Result<()> {
                                     prompt.insert(x);
                                 }
                             }
+                            KeyCode::Left => {
+                                if event.modifiers.contains(KeyModifiers::CONTROL) {
+                                    prompt.left_word();
+                                } else {
+                                    prompt.left_char();
+                                }
+                            }
+                            KeyCode::Right => {
+                                if event.modifiers.contains(KeyModifiers::CONTROL) {
+                                    prompt.right_word();
+                                } else {
+                                    prompt.right_char();
+                                }
+                            }
+                            KeyCode::Backspace => prompt.backspace(),
+                            KeyCode::Tab => {
+                                if let Some((prefix, &[])) = parse_command(prompt.before_cursor()) {
+                                    let prefix = prefix.iter().collect::<String>();
+                                    let rest = prompt.after_cursor().iter().collect::<String>();
+                                    if let Some(command) = COMMANDS
+                                        .iter()
+                                        .find(|command| command.name.starts_with(&prefix))
+                                    {
+                                        prompt.clear();
+                                        prompt.insert(':');
+                                        prompt.insert_str(command.name);
+                                        prompt.insert_str(&rest);
+                                        prompt.cursor = command.name.len() + 1;
+                                    }
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some((name, argument)) = parse_command(&prompt.buffer) {
+                                    let name = name.iter().collect::<String>();
+                                    let argument = argument.iter().collect::<String>();
+                                    if let Some(command) = find_command(&name) {
+                                        ((command.run)(&mut client, &argument));
+                                    } else {
+                                        chat_error!(&mut client.chat, "Unknown comman `:{name}");
+                                    }
+                                } else {
+                                    if let Some(stream) = &mut client.stream {
+                                        let prompt = prompt.buffer.iter().collect::<String>();
+                                        stream.write(prompt.as_bytes())?;
+                                        chat_msg!(&mut client.chat, "{text}", text = &prompt);
+                                    } else {
+                                        chat_info!(
+                                            &mut client.chat,
+                                            "You are offline. Use {signature} to connecto to a server",
+                                            signature = find_command("connect")
+                                                .expect("connect command")
+                                                .signature
+                                        );
+                                    }
+                                }
+                                prompt.clear();
+                            }
                             _ => {}
                         }
                     }
@@ -539,7 +598,7 @@ fn main() -> io::Result<()> {
             }
         }
 
-        if let Some(ref mut s) = &mut client.stream {
+        if let Some(s) = &mut client.stream {
             match s.read(&mut buf) {
                 Ok(n) => {
                     if n > 0 {
