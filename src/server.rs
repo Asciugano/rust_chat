@@ -1,7 +1,7 @@
 use getrandom;
+use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
-use std::fmt;
-use std::fmt::Write as FmtWrite;
+use std::fmt::{write, Write as FmtWrite};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::result;
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::{Duration, SystemTime};
+use std::{fmt, io};
 
 type Result<T> = result::Result<T, ()>;
 
@@ -90,7 +91,172 @@ impl Server {
         }
     }
 
-    fn client_connected(&mut self, mut author: TcpStream, author_addr: SocketAddr, token: Token) {}
+    fn client_connected(&mut self, mut author: TcpStream, author_addr: SocketAddr, token: Token) {
+        let now = SystemTime::now();
+
+        if let Some(sinner) = self.sinners.get_mut(&author_addr.ip()) {
+            match sinner {
+                Sinner::Banned(banned_at) => {
+                    let diff = now.duration_since(*banned_at).unwrap_or_else(|err| {
+                        eprintln!("[ERROR]: ban time check on client connection: the clock might have gone backwards: {err}");
+                        Duration::ZERO
+                    });
+                    if diff < BAN_LIMIT {
+                        let secs = (BAN_LIMIT - diff).as_secs_f32();
+                        println!(
+                            "[INFO]: Client {author} tried to connect, but is banned for {secs} s",
+                            author = Sensitive(author_addr),
+                        );
+                        let _ =
+                            writeln!(author, "You are banned: {secs} secs left").map_err(|err| {
+                                eprintln!(
+                                    "[ERROR]: Could not send banned message to {author}: {err}",
+                                    author = Sensitive(author_addr),
+                                    err = Sensitive(err)
+                                );
+                            });
+                        let _ = author.shutdown(Shutdown::Both).map_err(|err| {
+                            eprintln!(
+                                "[ERROR]: Could not shutdown socket for {author}: {err}",
+                                author = Sensitive(author_addr),
+                                err = Sensitive(err)
+                            );
+                        });
+
+                        return;
+                    } else {
+                        sinner.forgive();
+                    }
+                }
+                Sinner::Striked(_) => {}
+            }
+        }
+
+        println!(
+            "[INFO]: Client {author} connected",
+            author = Sensitive(author_addr)
+        );
+        self.clients.insert(
+            token,
+            Client {
+                conn: author,
+                last_message: now - 2 * MESSAGE_RATE,
+                connected_at: now,
+                authed: false,
+                addr: author_addr,
+            },
+        );
+    }
+
+    fn client_read(&mut self, token: Token) {
+        if let Some(author) = self.clients.get_mut(&token) {
+            let author_addr: SocketAddr = author.addr.clone();
+            let mut buffer = [0; 64];
+            let bytes: Vec<_> = match author.conn.read(&mut buffer) {
+                Ok(0) => {
+                    println!(
+                        "[INFO]: Client {author} disconnected",
+                        author = Sensitive(author_addr)
+                    );
+                    self.clients.remove(&token);
+                    return;
+                }
+                Ok(n) => buffer[0..n].iter().cloned().filter(|x| *x >= 32).collect(),
+                Err(err) => {
+                    if err.kind() != io::ErrorKind::WouldBlock {
+                        eprintln!(
+                            "[ERROR]: Could not read message from {author}: {err}",
+                            author = Sensitive(author_addr),
+                            err = Sensitive(err)
+                        );
+                        self.clients.remove(&token);
+                    }
+                    return;
+                }
+            };
+
+            let now = SystemTime::now();
+            let diff = now.duration_since(author.last_message).unwrap_or_else(|err| {
+                eprintln!("[ERROR]: message rate check on new message: the clock might have gone backwards: {err}");
+                Duration::from_secs(0)
+            });
+            if diff < MESSAGE_RATE {
+                self.strike_ip(author_addr.ip());
+                return;
+            }
+            let text = if let Ok(text) = str::from_utf8(&bytes) {
+                text
+            } else {
+                return;
+            };
+            self.sinners
+                .entry(author_addr.ip())
+                .or_insert(Sinner::new())
+                .forgive();
+            author.last_message = now;
+            if author.authed {
+                println!(
+                    "[INFO]: Client {author} sent message {bytes:?}",
+                    author = Sensitive(author_addr)
+                );
+                for (client_token, client) in self.clients.iter_mut() {
+                    if *client_token != token && client.authed {
+                        let _ = writeln!(client.conn, "{text}").map_err(|err| {
+                            eprintln!("[ERROR]: could not broadcast message to all the clients from {author}: {err}", author = Sensitive(author_addr), err = Sensitive(err));
+                        });
+                    }
+                }
+            } else {
+                if text != self.token {
+                    println!("[INFO]: {} failed authorization", Sensitive(author_addr));
+                    let _ = writeln!(author.conn, "Invalid tokwn").map_err(|err| {
+                        eprintln!(
+                            "[ERROR]: could not notify the client {} about invalid token: {}",
+                            Sensitive(author_addr),
+                            Sensitive(err)
+                        );
+                    });
+
+                    let _ = author.conn.shutdown(Shutdown::Both).map_err(|err| {
+                        eprintln!(
+                            "[ERROR]: could not shutdown {}: {}",
+                            Sensitive(author_addr),
+                            Sensitive(err)
+                        );
+                    });
+                    self.clients.remove(&token);
+                    self.strike_ip(author_addr.ip());
+                    return;
+                }
+
+                author.authed = true;
+                println!("[INFO]: {} authorized", Sensitive(author_addr));
+                let _ = writeln!(author.conn, "Welcome to the club").map_err(|err| {
+                    eprintln!("[ERROR]: could not send the welcome message to {}: {}", Sensitive(author_addr), Sensitive(err));
+                });
+            }
+        }
+    }
+
+    fn strike_ip(&mut self, ip: IpAddr) {
+        let sinner = self.sinners.entry(ip).or_insert(Sinner::new());
+        if sinner.strike() {
+            println!("[INFO]: IP {ip} got banned", ip = Sensitive(ip));
+            self.clients.retain(|_token, client| {
+                let addr: SocketAddr = client.addr.clone();
+                if addr.ip() == ip {
+                    let _ = writeln!(client.conn, "You are banned").map_err(|err| {
+                        eprintln!("[ERROR]: could not send banned message to {}: {}", Sensitive(addr), Sensitive(err));
+                    });
+                    let _ = client.conn.shutdown(Shutdown::Both).map_err(|err| {
+                        eprintln!("[ERROR]: could not shutdown socket for {}: {}", Sensitive(addr), Sensitive(err));
+                    });
+                    return false;
+                }
+                true
+            });
+        }
+    }
 }
 
 struct Client {
