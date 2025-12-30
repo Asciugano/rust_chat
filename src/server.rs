@@ -1,15 +1,15 @@
 use getrandom;
-use mio::{Events, Interest, Poll, Token};
+use mio::{
+    Events, Interest, Poll, Token,
+    net::{TcpListener, TcpStream},
+};
 use std::collections::HashMap;
-use std::fmt::{write, Write as FmtWrite};
+use std::fmt::Write as FmtWrite;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::result;
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread;
+use std::net::{IpAddr, Shutdown, SocketAddr};
 use std::time::{Duration, SystemTime};
 use std::{fmt, io};
+use std::{fs, result};
 
 type Result<T> = result::Result<T, ()>;
 
@@ -31,19 +31,6 @@ impl<T: fmt::Display> fmt::Display for Sensitive<T> {
             inner.fmt(f)
         }
     }
-}
-
-enum Message {
-    ClientConnected {
-        author: Arc<TcpStream>,
-    },
-    ClientDisconected {
-        author_addr: SocketAddr,
-    },
-    NewMessage {
-        author_addr: SocketAddr,
-        bytes: Vec<u8>,
-    },
 }
 
 enum Sinner {
@@ -232,7 +219,11 @@ impl Server {
                 author.authed = true;
                 println!("[INFO]: {} authorized", Sensitive(author_addr));
                 let _ = writeln!(author.conn, "Welcome to the club").map_err(|err| {
-                    eprintln!("[ERROR]: could not send the welcome message to {}: {}", Sensitive(author_addr), Sensitive(err));
+                    eprintln!(
+                        "[ERROR]: could not send the welcome message to {}: {}",
+                        Sensitive(author_addr),
+                        Sensitive(err)
+                    );
                 });
             }
         }
@@ -246,10 +237,18 @@ impl Server {
                 let addr: SocketAddr = client.addr.clone();
                 if addr.ip() == ip {
                     let _ = writeln!(client.conn, "You are banned").map_err(|err| {
-                        eprintln!("[ERROR]: could not send banned message to {}: {}", Sensitive(addr), Sensitive(err));
+                        eprintln!(
+                            "[ERROR]: could not send banned message to {}: {}",
+                            Sensitive(addr),
+                            Sensitive(err)
+                        );
                     });
                     let _ = client.conn.shutdown(Shutdown::Both).map_err(|err| {
-                        eprintln!("[ERROR]: could not shutdown socket for {}: {}", Sensitive(addr), Sensitive(err));
+                        eprintln!(
+                            "[ERROR]: could not shutdown socket for {}: {}",
+                            Sensitive(addr),
+                            Sensitive(err)
+                        );
                     });
                     return false;
                 }
@@ -257,6 +256,42 @@ impl Server {
             });
         }
     }
+
+    fn update(&mut self, token: Token) {
+        self.client_read(token);
+
+        self.clients.retain(|_, client| {
+            let addr = client.addr.clone();
+            if !client.authed {
+                let now = SystemTime::now();
+                let diff = now.duration_since(client.connected_at).unwrap_or_else(|err| {
+                    eprintln!("[ERROR]: slowloris time limit check: the clock might have gone backwards: {err}");
+                    SLOWORIS_LIMIT
+                });
+                if diff >= SLOWORIS_LIMIT {
+                    self.sinners.entry(addr.ip()).or_insert(Sinner::new()).strike();
+                    let _ = client.conn.shutdown(Shutdown::Both).map_err(|err| {
+                        eprintln!("[ERROR]: could not shutdown socket for {}: {}", Sensitive(addr), Sensitive(err));
+                    });
+                    return false;
+                }
+            }
+            true
+        });
+    }
+}
+
+fn generate_token() -> Result<String> {
+    let mut buffer = [0; 16];
+    let _ = getrandom::fill(&mut buffer).map_err(|err| {
+        eprintln!("[ERROR]: could not generate random access token: {err}");
+    })?;
+
+    let mut token = String::new();
+    for x in buffer.iter() {
+        let _ = write!(&mut token, "{x:02X}");
+    }
+    Ok(token)
 }
 
 struct Client {
@@ -267,293 +302,66 @@ struct Client {
     addr: SocketAddr,
 }
 
-fn server(messages: Receiver<Message>, token: String) -> Result<()> {
-    let mut clients = HashMap::<SocketAddr, Client>::new();
-    let mut banned_mfs = HashMap::<IpAddr, SystemTime>::new();
-    loop {
-        let msg = messages.recv().expect("The server reciver is not hunng up");
-        match msg {
-            Message::ClientConnected { author } => {
-                let author_addr = author.peer_addr().expect("TODO: cache the peer_addr");
-                let mut banned_at = banned_mfs.get(&author_addr.ip());
-                let now = SystemTime::now();
-
-                banned_at = banned_at.and_then(|banned_at| {
-                    let diff = now
-                        .duration_since(*banned_at)
-                        .expect("TODO: don't crash if the clock went backwards");
-
-                    if diff >= BAN_LIMIT {
-                        None
-                    } else {
-                        Some(banned_at)
-                    }
-                });
-
-                if let Some(banned_at) = banned_at {
-                    let diff = now
-                        .duration_since(*banned_at)
-                        .expect("TODO: don't crash if the clock went backwards");
-
-                    banned_mfs.insert(author_addr.ip().clone(), *banned_at);
-
-                    let mut author = author.as_ref();
-                    let secs = (BAN_LIMIT - diff).as_secs_f32();
-                    println!(
-                        "[INFO]: Client {addr} try to connect but is banned, for {secs} secs",
-                        addr = Sensitive(author_addr)
-                    );
-                    let _ = writeln!(author, "You are banned: {secs} secs left",);
-                    let _ = author.shutdown(Shutdown::Both);
-                    clients.remove(&author_addr);
-                } else {
-                    println!(
-                        "[INFO]: Client {addr} connected",
-                        addr = Sensitive(author_addr)
-                    );
-                    clients.insert(
-                        author_addr.clone(),
-                        Client {
-                            conn: author.clone(),
-                            last_message: now,
-                            strike_count: 0,
-                            authed: false,
-                        },
-                    );
-
-                    let _ = writeln!(author.as_ref(), "Token: ").map_err(|err| {
-                        eprintln!(
-                            "[ERROR]: Could not send Token prompt to {}: {}",
-                            Sensitive(author_addr),
-                            Sensitive(err)
-                        );
-                    });
-                }
-            }
-            Message::ClientDisconected { author_addr } => {
-                println!(
-                    "[INFO]: Client {addr} disconnected",
-                    addr = Sensitive(author_addr)
-                );
-                clients.remove(&author_addr);
-            }
-            Message::NewMessage { author_addr, bytes } => {
-                if let Some(author) = clients.get_mut(&author_addr) {
-                    let now = SystemTime::now();
-
-                    let diff = now
-                        .duration_since(author.last_message)
-                        .expect("TODO: don't crash if the clock went backwards");
-
-                    if diff >= MESSAGE_RATE {
-                        if let Ok(text) = str::from_utf8(&bytes) {
-                            println!(
-                                "[INFO]: Client {addr} sent message: {bytes:?}",
-                                addr = Sensitive(author_addr),
-                            );
-                            if author.authed {
-                                for (addr, client) in clients.iter() {
-                                    if *addr != author_addr && client.authed {
-                                        let _ = writeln!(client.conn.as_ref(), "{text}").map_err(|err| {
-                                            eprintln!(
-                                                "[ERROR]: Could not broadcast message to all the clients from {addr}: {err}",
-                                                addr = Sensitive(author_addr),
-                                                err = Sensitive(err)
-                                            )
-                                        });
-                                    }
-                                }
-                            } else {
-                                if text == token {
-                                    author.authed = true;
-                                    println!("[INFO]: {} authorized", Sensitive(author_addr));
-                                    let _ = writeln!(author.conn.as_ref(), "Welcome to the club")
-                                        .map_err(|err| {
-                                        eprintln!(
-                                            "[ERROR]: Could not send the welcome message to {}: {}",
-                                            Sensitive(author_addr),
-                                            Sensitive(err)
-                                        );
-                                    })?;
-                                } else {
-                                    let _ = writeln!(author.conn.as_ref(), "Invalid Token").map_err(|err| {
-                                        eprintln!(
-                                            "[ERROR]: Could not notify the client {} about invalid token: {}",
-                                            Sensitive(author_addr),
-                                            Sensitive(err)
-                                        );
-                                    });
-                                    eprintln!("[ERROR]: failed to authorized");
-                                    let _ = author.conn.shutdown(Shutdown::Both).map_err(|err| {
-                                        eprintln!(
-                                            "[ERROR]: Could not shutdown {}: {}",
-                                            Sensitive(author_addr),
-                                            Sensitive(err)
-                                        );
-                                    });
-                                    clients.remove(&author_addr);
-                                }
-                            }
-                        } else {
-                            author.strike_count += 1;
-
-                            if author.strike_count >= STRIKE_LIMIT {
-                                println!(
-                                    "[INFO]: Client {addr} got banned",
-                                    addr = Sensitive(author_addr),
-                                );
-                                banned_mfs.insert(author_addr.ip().clone(), now);
-                                let _ = writeln!(author.conn.as_ref(), "You are banned").map_err(|err| {
-                                    eprintln!(
-                                        "[ERROR]: Could not send banned message to {addr}: {err}",
-                                        addr = Sensitive(author_addr),
-                                        err = Sensitive(err)
-                                    )
-                                });
-                                let _ = author.conn.shutdown(Shutdown::Both).map_err(|err| {
-                                    eprintln!(
-                                        "[ERROR]: Could not shutdown socket for {addr}: {err}",
-                                        addr = Sensitive(author_addr),
-                                        err = Sensitive(err)
-                                    )
-                                });
-                            }
-                        }
-                    } else {
-                        author.strike_count += 1;
-
-                        if author.strike_count >= STRIKE_LIMIT {
-                            banned_mfs.insert(author_addr.ip().clone(), now);
-                            println!(
-                                "[INFO]: Client {addr} got banned",
-                                addr = Sensitive(author_addr),
-                            );
-                            let _ =
-                                writeln!(author.conn.as_ref(), "You are banned").map_err(|err| {
-                                    eprintln!(
-                                        "[ERROR]: Could not send banned message to {addr}: {err}",
-                                        addr = Sensitive(author_addr),
-                                        err = Sensitive(err)
-                                    )
-                                });
-                            let _ = author.conn.shutdown(Shutdown::Both).map_err(|err| {
-                                eprintln!(
-                                    "[ERROR]: Could not shutdown socket for {addr}: {err}",
-                                    addr = Sensitive(author_addr),
-                                    err = Sensitive(err)
-                                )
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn client(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
-    let author_addr = stream.peer_addr().map_err(|err| {
-        eprintln!("[ERROR]: Could not get peer_addr: {}", Sensitive(err));
+fn main() -> Result<()> {
+    let token = generate_token()?;
+    let token_file_path = "./TOKEN";
+    fs::write(token_file_path, token.as_bytes()).map_err(|err| {
+        eprintln!("[ERROR]: could not create token file {token_file_path}: {err}");
     })?;
 
-    messages
-        .send(Message::ClientConnected {
-            author: stream.clone(),
-        })
-        .map_err(|err| {
-            eprintln!(
-                "[ERROR]: Clould not send message to the server thread: {}",
-                Sensitive(err)
-            );
-        })?;
-    let mut buffer = Vec::new();
-    buffer.resize(64, 0);
-    loop {
-        let n = stream.as_ref().read(&mut buffer).map_err(|err| {
-            eprintln!(
-                "[ERROR]: Could not read from the client: {}",
-                Sensitive(err)
-            );
-            let _ = messages
-                .send(Message::ClientDisconected { author_addr })
-                .map_err(|err| {
-                    eprintln!(
-                        "[ERROR]: Clould not send message to the server thread: {}",
-                        Sensitive(err)
-                    );
-                });
-        })?;
-        if n > 0 {
-            let mut bytes = Vec::new();
-            for x in &buffer[0..n] {
-                if *x >= 32 {
-                    bytes.push(*x);
-                }
-            }
-            let _ = messages
-                .send(Message::NewMessage { bytes, author_addr })
-                .map_err(|err| {
-                    eprintln!(
-                        "[ERROR]: Could not send the message to the server thread: {}",
-                        Sensitive(err)
-                    );
-                })?;
-        } else {
-            let _ = messages
-                .send(Message::ClientDisconected { author_addr })
-                .map_err(|err| {
-                    eprintln!(
-                        "[ERROR]: Clould not send message to the server thread: {}",
-                        Sensitive(err)
-                    );
-                });
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn main() -> Result<()> {
-    let mut buffer = [0; 16];
-    let _ = getrandom::fill(&mut buffer).map_err(|err| {
+    println!("[INFO]: check {token_file_path} file for token");
+    let address = format!("0.0.0.0:{PORT}");
+    let mut listener = TcpListener::bind(address.parse().unwrap()).map_err(|err| {
         eprintln!(
-            "[ERROR]: Could not generate random random access buffer: {}",
+            "[ERROR]: could not bind {}: {}",
+            Sensitive(address.clone()),
             Sensitive(err)
         );
-    });
-
-    let mut token = String::new();
-    for x in buffer {
-        let _ = write!(&mut token, "{x:02X}");
-    }
-
-    println!("[TOKEN]: {token}");
-
-    let address = "0.0.0.0:4444";
-    let listener = TcpListener::bind(address).map_err(|err| {
-        eprintln!(
-            "[ERROR]: Could not bind {}: {}",
-            Sensitive(address),
-            Sensitive(err)
-        )
     })?;
+    let mut poll = Poll::new().map_err(|err| {
+        eprintln!("[ERROR]: could not create poll object: {err}");
+    })?;
+    let mut events = Events::with_capacity(1024);
+    let mut counter = 0;
 
-    println!("[INFO]: Listening on: {address}");
-    let (message_sender, message_reciver) = channel();
-    thread::spawn(|| server(message_reciver, token));
+    poll.registry()
+        .register(&mut listener, Token(counter), Interest::READABLE)
+        .map_err(|err| {
+            eprintln!("[ERROR]: could not register server soket in the poll object: {err}");
+        })?;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let stream = Arc::new(stream);
-                let message_sender = message_sender.clone();
-                thread::spawn(|| client(stream, message_sender));
-            }
-            Err(err) => {
-                eprintln!("[ERROR]: Could not accept connection: {}", Sensitive(err));
+    let mut server = Server::from_token(token);
+
+    println!("[INFO]: listening to {}", Sensitive(address));
+    loop {
+        if let Err(err) = poll.poll(&mut events, None) {
+            eprintln!("[ERROR]: Failed to poll: {err}");
+            continue;
+        }
+        for token in events.iter().map(|e| e.token()) {
+            match token {
+                Token(0) => match listener.accept() {
+                    Ok((mut stream, author_addr)) => {
+                        counter += 1;
+                        let token = Token(counter);
+                        match poll
+                            .registry()
+                            .register(&mut stream, token, Interest::READABLE)
+                        {
+                            Ok(_) => server.client_connected(stream, author_addr, token),
+                            Err(err) => eprintln!(
+                                "[ERROR]: could not register client socket in the poll object: {err}"
+                            ),
+                        }
+                    }
+                    Err(err) => {
+                        if err.kind() != io::ErrorKind::WouldBlock {
+                            eprintln!("[ERROR]: could not accept connection: {err}");
+                        }
+                    }
+                },
+                token => server.update(token),
             }
         }
     }
-
-    Ok(())
 }
